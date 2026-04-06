@@ -9,9 +9,10 @@ Output:
     pdf_metadata.xlsx in the current working directory
 
 Requirements:
-    pip install pypdf pdfplumber openpyxl
+    pip install pypdf openpyxl
 """
 
+import multiprocessing
 import os
 import sys
 import datetime
@@ -19,7 +20,6 @@ import re
 from pathlib import Path
 
 import pypdf
-import pdfplumber
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
@@ -27,14 +27,16 @@ from openpyxl.utils import get_column_letter
 
 # ── Metadata extraction ──────────────────────────────────────────────────────
 
-def extract_metadata(pdf_path: Path) -> dict:
+def _extract_metadata(pdf_path: Path, root_folder: Path) -> dict:
     """Extract metadata from a single PDF file."""
     result = {
         "filename":       pdf_path.name,
+        "relative_path":  str(pdf_path.relative_to(root_folder)),
         "filepath":       str(pdf_path.resolve()),
         "file_size_kb":   round(pdf_path.stat().st_size / 1024, 1),
         "page_count":     None,
         "title":          None,
+        "title_source":   None,
         "author":         None,
         "subject":        None,
         "creator":        None,
@@ -60,20 +62,115 @@ def extract_metadata(pdf_path: Path) -> dict:
         result["creation_date"] = _parse_pdf_date(meta.get("/CreationDate"))
         result["modified_date"] = _parse_pdf_date(meta.get("/ModDate"))
 
-        # ── pdfplumber: text extraction + word count ─────────────────────────
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            all_text = ""
-            for page in pdf.pages:
+        # ── pypdf: text extraction + word count ───────────────────────────────
+        all_text = ""
+        for page in reader.pages:
+            try:
                 page_text = page.extract_text() or ""
-                all_text += page_text
+            except Exception:
+                page_text = ""
+            all_text += page_text
 
         result["has_text"]  = len(all_text.strip()) > 0
         result["word_count"] = len(all_text.split()) if result["has_text"] else 0
+
+        if result["title"]:
+            result["title_source"] = "metadata"
+        else:
+            first_page_text = ""
+            if reader.pages:
+                try:
+                    first_page_text = reader.pages[0].extract_text() or ""
+                except Exception:
+                    first_page_text = ""
+            result["title"] = _extract_title_from_text(first_page_text)
+            if result["title"]:
+                result["title_source"] = "first_page_text"
 
     except Exception as exc:
         result["error"] = str(exc)
 
     return result
+
+
+def _extract_metadata_worker(pdf_path_str: str, root_folder_str: str, queue: multiprocessing.Queue):
+    pdf_path = Path(pdf_path_str)
+    root_folder = Path(root_folder_str)
+    try:
+        result = _extract_metadata(pdf_path, root_folder)
+    except Exception as exc:
+        result = {
+            "filename":       pdf_path.name,
+            "relative_path":  str(pdf_path.relative_to(root_folder)) if root_folder in pdf_path.parents else str(pdf_path),
+            "filepath":       str(pdf_path.resolve()),
+            "file_size_kb":   round(pdf_path.stat().st_size / 1024, 1) if pdf_path.exists() else None,
+            "page_count":     None,
+            "title":          None,
+            "title_source":   None,
+            "author":         None,
+            "subject":        None,
+            "creator":         None,
+            "producer":       None,
+            "creation_date":  None,
+            "modified_date": None,
+            "word_count":     None,
+            "has_text":       None,
+            "error":          str(exc),
+        }
+    queue.put(result)
+
+
+def extract_metadata(pdf_path: Path, root_folder: Path, timeout: int = 30) -> dict:
+    queue = multiprocessing.Queue()
+    process = multiprocessing.Process(
+        target=_extract_metadata_worker,
+        args=(str(pdf_path), str(root_folder), queue),
+    )
+    process.start()
+    process.join(timeout)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        return {
+            "filename":       pdf_path.name,
+            "relative_path":  str(pdf_path.relative_to(root_folder)),
+            "filepath":       str(pdf_path.resolve()),
+            "file_size_kb":   round(pdf_path.stat().st_size / 1024, 1),
+            "page_count":     None,
+            "title":          None,
+            "title_source":   None,
+            "author":         None,
+            "subject":        None,
+            "creator":         None,
+            "producer":       None,
+            "creation_date":  None,
+            "modified_date": None,
+            "word_count":     None,
+            "has_text":       None,
+            "error":          f"timeout after {timeout} seconds",
+        }
+
+    if queue.empty():
+        return {
+            "filename":       pdf_path.name,
+            "relative_path":  str(pdf_path.relative_to(root_folder)),
+            "filepath":       str(pdf_path.resolve()),
+            "file_size_kb":   round(pdf_path.stat().st_size / 1024, 1),
+            "page_count":     None,
+            "title":          None,
+            "title_source":   None,
+            "author":         None,
+            "subject":        None,
+            "creator":         None,
+            "producer":       None,
+            "creation_date":  None,
+            "modified_date": None,
+            "word_count":     None,
+            "has_text":       None,
+            "error":          "worker process failed without result",
+        }
+
+    return queue.get()
 
 
 def _clean(value) -> str | None:
@@ -106,13 +203,33 @@ def _parse_pdf_date(raw) -> str | None:
     return s  # Return raw string if parsing fails
 
 
+def _extract_title_from_text(text: str) -> str | None:
+    """Return the first plausible title-like line from PDF text."""
+    if not text:
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.isdigit():
+            continue
+        if re.fullmatch(r"page\s*\d+", line, re.IGNORECASE):
+            continue
+        if len(line) < 10:
+            continue
+        return line[:200]
+    return None
+
+
 # ── Spreadsheet creation ─────────────────────────────────────────────────────
 
 COLUMNS = [
     ("filename",        "Filename",         28),
+    ("relative_path",   "Relative Path",    40),
     ("page_count",      "Pages",             8),
     ("file_size_kb",    "File Size (KB)",   14),
     ("title",           "Title",            30),
+    ("title_source",    "Title Source",     16),
     ("author",          "Author",           22),
     ("subject",         "Subject",          25),
     ("creator",         "Creator",          20),
@@ -212,7 +329,7 @@ def main():
     records = []
     for i, pdf_path in enumerate(pdf_files, start=1):
         print(f"  [{i}/{len(pdf_files)}] {pdf_path.name}", end="\r")
-        records.append(extract_metadata(pdf_path))
+        records.append(extract_metadata(pdf_path, folder))
 
     print()  # newline after progress line
 
